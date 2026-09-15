@@ -4,6 +4,8 @@
 
 Open-source, reverse-engineered **BLE GPS / geotagging adapter for Sony Alpha cameras** using the **Seeed XIAO ESP32-C6**.
 
+> **AI-assisted development:** this project was developed with substantial technical and documentation assistance from **OpenAI ChatGPT (GPT-5.6 Sol)**. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for a transparent breakdown of the collaboration.
+
 > **Current status:** the Sony BLE protocol proof-of-concept has been verified end-to-end on a **Sony A7R III (ILCE-7RM3, firmware 3.01)**. The firmware in this repository is the known-good **static-location v6 PoC** used for that validation. Real GNSS input (MAX-M10S), track logging, timezone handling, and low-power operation are the next development stage.
 
 This is a community interoperability project and is **not affiliated with, sponsored by, or endorsed by Sony or u-blox**.
@@ -105,8 +107,15 @@ See [docs/hardware-prototype.md](docs/hardware-prototype.md).
 | Automatic timezone/DST database | 🚧 Planned |
 | Compact PCB/enclosure | 🚧 Planned |
 
+## Acknowledgements
+
+A substantial part of the protocol analysis, BLE debugging, firmware iteration, documentation, and hardware architecture planning was carried out collaboratively with **OpenAI ChatGPT (GPT-5.6 Sol)**. Physical hardware work and real-camera validation were performed by the repository owner.
+
+See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for details.
+
 ## Documentation
 
+- [Acknowledgements / AI collaboration](ACKNOWLEDGEMENTS.md)
 - [Protocol notes](docs/protocol-notes.md)
 - [Hardware prototype](docs/hardware-prototype.md)
 - [Validation notes](docs/validation.md)
