@@ -1,0 +1,10 @@
+.pio/
+.vscode/
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+build/
+.DS_Store
+Thumbs.db
+*.log
