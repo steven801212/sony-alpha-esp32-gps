@@ -1,0 +1,28 @@
+# Sony A7R III Bluedroid PoC on Seeed XIAO ESP32-C6
+#
+# IMPORTANT: this PoC intentionally selects the Bluedroid BLE 4.2 feature set.
+# The legacy GAP scan APIs used by main.cpp (esp_ble_gap_set_scan_params,
+# esp_ble_gap_start_scanning, esp_ble_gap_stop_scanning) are compiled only
+# when BLE 4.2 legacy scanning support is enabled. BLE 4.2 and BLE 5.x
+# Bluedroid feature sets are mutually exclusive in ESP-IDF.
+
+# Bluetooth controller / Bluedroid host
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=n
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=n
+
+# Use legacy BLE 4.2 feature set for Sony A7R III (Bluetooth 4.1 generation).
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_42_SCAN_EN=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
+
+# GATT client + SMP bonding
+CONFIG_BT_GATTC_ENABLE=y
+CONFIG_BT_GATTS_ENABLE=y
+CONFIG_BT_BLE_SMP_ENABLE=y
+CONFIG_BT_BLE_SMP_BOND_NVS_FLASH=y
+
+# XIAO ESP32-C6 has 4 MB flash. ESP-IDF otherwise defaults to 2 MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
