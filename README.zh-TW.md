@@ -4,6 +4,8 @@
 
 這是一個以 **Seeed XIAO ESP32-C6** 製作的開源 Sony Alpha 相機 **BLE GPS／照片地理標記（geotagging）轉接器**。
 
+> **AI 協作開發：** 本專案在協定分析、BLE 除錯、韌體迭代、文件與硬體架構規劃上，大量使用 **OpenAI ChatGPT（GPT-5.6 Sol）** 協作。完整說明見 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。
+
 > **目前狀態：Sony BLE 通訊已完成端到端 PoC 驗證。** 已在 **Sony A7R III（ILCE-7RM3，韌體 3.01）** 實機成功完成 BLE 掃描、配對、Bond 持久化、Location service 寫入，並確認相機拍攝的 ARW RAW 檔真的寫入了 ESP32 傳送的 GPS 座標與 UTC 時間。
 
 目前 repo 的韌體是實際成功的 **v6 靜態座標 PoC**。真正的 MAX-M10S GNSS 輸入、5–10 秒低功耗更新、軌跡記錄、時區資料庫與小型 PCB 是下一階段。
@@ -89,6 +91,21 @@ GND         -> GND
 | 外部 Flash 軌跡記錄 / GPX | 🚧 規劃中 |
 | 自動時區 / DST | 🚧 規劃中 |
 | 小型 PCB / 外殼 | 🚧 規劃中 |
+
+## 致謝／AI 協作
+
+本專案相當一部分的 Sony BLE protocol 分析、ESP-IDF / Bluedroid 除錯、韌體迭代、文件整理與後續硬體架構規劃，都是與 **OpenAI ChatGPT（GPT-5.6 Sol）** 共同完成。實體硬體組裝、Sony 相機操作與實機驗證則由 repository owner 執行。
+
+完整貢獻說明見 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。
+
+## 文件
+
+- [致謝／AI 協作](ACKNOWLEDGEMENTS.md)
+- [Protocol notes](docs/protocol-notes.md)
+- [Hardware prototype](docs/hardware-prototype.md)
+- [Validation notes](docs/validation.md)
+- [Roadmap](docs/roadmap.md)
+- [Third-party references](THIRD_PARTY_NOTICES.md)
 
 ## 隱私
 
