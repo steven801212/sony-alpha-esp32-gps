@@ -6,7 +6,7 @@ Open-source, reverse-engineered **BLE GPS / geotagging adapter for Sony Alpha ca
 
 > **AI-assisted development:** this project was developed with substantial technical and documentation assistance from **OpenAI ChatGPT (GPT-5.6 Sol)**. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
 
-> **Current release: v7.** The core v7 path has now been re-validated on a **Sony A7R III (ILCE-7RM3, firmware 3.01)**: existing-bond reconnect, MTU 158, DD21-driven 95-byte packet selection, repeated DD11 writes, E7 coordinate preservation into ARW EXIF, and timezone metadata written as `+08:00` for the Taiwan test coordinate. Fresh pairing after deleting bond state on both sides still remains to be repeated with v7.
+> **Current release: v7.** The core v7 path is now hardware-validated on a **Sony A7R III (ILCE-7RM3, firmware 3.01)**: fresh pairing from an empty local bond database, automatic retry after an SMP `REPEATED_ATTEMPT`, persistent bond storage, cold reconnect, MTU 158, DD21-driven 95-byte packet selection, repeated DD11 writes, E7 coordinate preservation into ARW EXIF, and timezone metadata written as `+08:00` for the Taiwan test coordinate.
 
 This is a community interoperability project and is **not affiliated with, sponsored by, or endorsed by Sony or u-blox**.
 
@@ -32,16 +32,18 @@ This is a community interoperability project and is **not affiliated with, spons
 | Feature | Status |
 |---|---|
 | ESP32-C6 scan/connect to A7R III | ✅ Verified |
+| Fresh pairing from empty local bond DB | ✅ v7 verified |
+| Automatic retry after SMP `REPEATED_ATTEMPT` | ✅ v7 verified |
 | SMP bond/encryption | ✅ Verified |
-| Bond persistence after full power removal | ✅ Verified |
+| Bond persistence after full power removal | ✅ v7 verified |
+| Cold automatic reconnect without re-pairing | ✅ v7 verified |
 | MTU request 158 | ✅ Verified |
 | DD00 / DD11 / DD21 path | ✅ Verified |
-| Fixed single SC-capable security profile on reconnect | ✅ v7 verified |
+| Fixed single SC-capable security profile | ✅ v7 verified |
 | DD21-driven 95-byte selection on tested A7R III | ✅ v7 verified |
 | Repeated 95-byte DD11 writes | ✅ v7 verified |
 | E7 7-decimal coordinate preservation to ARW | ✅ v7 verified |
 | Taiwan timezone metadata (`+08:00`) | ✅ v7 verified |
-| Fresh pairing after clearing bond state | ⏳ v7 re-test pending |
 | Optional DD30/DD31 sequence | 🧪 not exposed on tested A7R III |
 | Offline timezone/DST resolver | ✅ Taiwan path verified; global boundaries remain compact/approximate |
 | CC13 camera local-time sync | 🧪 implemented, **disabled by default**; CC13 not exposed on tested A7R III |
@@ -64,6 +66,34 @@ scan
 ```
 
 The tested A7R III did **not** expose `DD30`, `DD31`, or `CC13`, so those paths remain optional.
+
+### Fresh-pair and cold-reconnect result
+
+With the ESP32 local bond database empty, v7 reported:
+
+```text
+local bond before request=0
+```
+
+The first SMP attempt returned `REPEATED_ATTEMPT`; v7 disconnected and retried with the **same fixed security profile**. The second attempt exchanged keys and completed successfully:
+
+```text
+Key exchanged: 1 / 2 / 16 / 32
+Authentication complete: success=1
+local bond now=1
+```
+
+After power cycling and reconnecting without entering camera pairing mode, v7 reported:
+
+```text
+local bond before request=1
+Authentication complete: success=1
+MTU=158
+DD21 -> 95 bytes
+DD11 TX -> OK
+```
+
+This confirms persistent bond storage and automatic GPS-path restoration after reconnect on the tested A7R III.
 
 ## v7 ARW result
 
@@ -118,7 +148,7 @@ framework = espidf
 
 Open in VS Code/PlatformIO, then **Build**, **Upload**, and **Monitor** at `115200` baud. After changing Bluetooth Kconfig options, perform a clean rebuild; on Windows use `CLEAN_REBUILD_WINDOWS.bat`.
 
-> **Build validation:** GitHub Actions performs a clean PlatformIO/ESP-IDF build for `seeed_xiao_esp32c6`. Real-hardware v7 reconnect, DD21 95-byte selection, DD11 transmission, E7 ARW preservation and Taiwan timezone metadata have also now been validated on the A7R III.
+> **Build / hardware validation:** GitHub Actions performs a clean PlatformIO/ESP-IDF build for `seeed_xiao_esp32c6`. On the A7R III, v7 fresh pairing, persistent bonding, cold reconnect, DD21 95-byte selection, DD11 transmission, E7 ARW preservation and Taiwan timezone metadata have all been validated.
 
 ## Planned portable hardware
 
