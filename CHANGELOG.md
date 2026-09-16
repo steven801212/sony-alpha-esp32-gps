@@ -2,7 +2,7 @@
 
 ## v7 — 2026-09-16
 
-Experimental software release built on the hardware-verified v6 BLE baseline.
+Hardware-validated software release built on the successful v6 BLE baseline.
 
 ### Added
 - Compact offline coordinate -> timezone/DST resolver that does not require external flash.
@@ -17,9 +17,15 @@ Experimental software release built on the hardware-verified v6 BLE baseline.
 ### Changed
 - Removed the v6 A/B security-profile alternation.
 - Fixed pairing configuration to the v6 profile that succeeded on the real A7R III: `ESP_LE_AUTH_REQ_SC_BOND`, IO NONE, key size 16, ENC+ID, SC-only enforcement disabled, GATTS enabled.
-- Updated public documentation to distinguish v6 hardware-verified behavior from v7 experimental additions.
+- Updated documentation to distinguish verified A7R III behavior from still-unvalidated optional paths.
 
 ### Validation status
-- Standalone timezone/DST math was compiled and exercised on the host for Taipei, Tokyo, Hong Kong, McMurdo, London, Paris, New York, Los Angeles and Sydney.
 - GitHub Actions completed a clean PlatformIO/ESP-IDF build successfully for the XIAO ESP32-C6 target.
-- A7R III real-hardware upload/re-test, CC13 verification and new ARW E7 verification remain pending.
+- A7R III existing-bond reconnect succeeded with the fixed v7 security profile.
+- MTU 158, DD00/DD11/DD21 discovery and repeated DD11 writes were verified on real hardware.
+- `DD21 = 06 10 00 9c 02 00 00` correctly selected the 95-byte packet.
+- The tested A7R III 3.01 exposed neither DD30/DD31 nor CC13; v7 safely skipped those optional paths.
+- A new ARW verified E7 coordinate propagation from `25.0339687, 121.5644687` to `25.0339686111, 121.5644686111`, the difference being final EXIF rational quantization to 0.001 arc-second.
+- The same ARW verified timezone metadata `+08:00` from the v7 Taiwan resolver (`+480 min`, DST 0).
+- v7 fresh pairing after deleting bond state on both sides remains pending.
+- Real MAX-M10S input and CC13 behavior on a camera that exposes CC13 remain pending.
