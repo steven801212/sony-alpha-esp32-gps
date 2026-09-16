@@ -12,6 +12,7 @@ Experimental software release built on the hardware-verified v6 BLE baseline.
 - Optional DD30/DD31 enable sequence when characteristics exist.
 - Sony CC00/CC13 discovery and an opt-in 13-byte camera local-time sync packet.
 - 5-second static location update interval.
+- GitHub Actions PlatformIO CI for `seeed_xiao_esp32c6`.
 
 ### Changed
 - Removed the v6 A/B security-profile alternation.
@@ -20,5 +21,5 @@ Experimental software release built on the hardware-verified v6 BLE baseline.
 
 ### Validation status
 - Standalone timezone/DST math was compiled and exercised on the host for Taipei, Tokyo, Hong Kong, McMurdo, London, Paris, New York, Los Angeles and Sydney.
-- Full ESP-IDF/PlatformIO build was not available in the assistant execution environment.
-- A7R III re-test, CC13 verification and new ARW E7 verification remain pending.
+- GitHub Actions completed a clean PlatformIO/ESP-IDF build successfully for the XIAO ESP32-C6 target.
+- A7R III real-hardware upload/re-test, CC13 verification and new ARW E7 verification remain pending.
