@@ -1,6 +1,6 @@
-# Sony A7R III Bluedroid PoC on Seeed XIAO ESP32-C6
+# Sony A7R III Bluedroid PoC / multi-camera development on Seeed XIAO ESP32-C6
 #
-# IMPORTANT: this PoC intentionally selects the Bluedroid BLE 4.2 feature set.
+# IMPORTANT: this project intentionally selects the Bluedroid BLE 4.2 feature set.
 # The legacy GAP scan APIs used by main.cpp (esp_ble_gap_set_scan_params,
 # esp_ble_gap_start_scanning, esp_ble_gap_stop_scanning) are compiled only
 # when BLE 4.2 legacy scanning support is enabled. BLE 4.2 and BLE 5.x
@@ -23,6 +23,11 @@ CONFIG_BT_GATTC_ENABLE=y
 CONFIG_BT_GATTS_ENABLE=y
 CONFIG_BT_BLE_SMP_ENABLE=y
 CONFIG_BT_BLE_SMP_BOND_NVS_FLASH=y
+
+# Multi-camera development target: two simultaneous Sony ACL/GATT links.
+# Bluedroid defaults to more than one connection, but make the requirement
+# explicit so a size-optimization change cannot silently reduce it to one.
+CONFIG_BT_ACL_CONNECTIONS=2
 
 # XIAO ESP32-C6 has 4 MB flash. ESP-IDF otherwise defaults to 2 MB.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

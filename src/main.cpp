@@ -17,38 +17,39 @@
 #include "esp_timer.h"
 #include "esp_err.h"
 
-// Sony Alpha ESP32 GPS v7 / Seeed XIAO ESP32-C6 / ESP-IDF Bluedroid.
+// Sony Alpha ESP32 GPS multi-camera development firmware.
+// Seeed XIAO ESP32-C6 / ESP-IDF Bluedroid.
 //
-// v7 is the first post-PoC cleanup release:
-//   * merges the v6 A/B pairing experiment into the known-good SC-capable profile
-//   * reads DD21 and emits the Sony 91- or 95-byte location packet accordingly
-//   * optionally performs DD30/DD31 enable writes when those characteristics exist
-//   * discovers CC13 and can synchronize the camera local clock
-//   * derives an offline timezone/DST from coordinates without external flash
-//   * preserves E7 (1e-7 degree) coordinates end-to-end in the packet builder
+// This branch refactors the hardware-validated v7 single-camera state machine
+// into independent per-camera sessions. The GNSS/location source remains
+// shared: one fix can be transmitted to up to MAX_CAMERAS Sony bodies.
 //
-// Interoperability behavior was independently implemented after studying public
-// Sony reverse-engineering projects, including Saschl/Alpha-GPS. No GPL source
-// code is copied into this MIT-licensed firmware; see THIRD_PARTY_NOTICES.md.
+// v7 remains the hardware-validated release. This development branch must not
+// be described as dual-camera verified until it is tested with two cameras
+// connected at the same time.
 
 namespace {
 
-// Synthetic/public test fix near Taipei 101. The non-zero 7th decimal
-// digit is deliberate so an ARW capture can verify E7 preservation.
+// Synthetic/public test fix near Taipei 101. This is intentionally unchanged
+// from v7 so single-camera regression testing can compare identical metadata.
 constexpr int32_t TEST_LAT_E7 = 250339687;
 constexpr int32_t TEST_LON_E7 = 1215644687;
 constexpr time_t BASE_UTC_EPOCH = 1789516800; // 2026-09-16 00:00:00 UTC
+
+constexpr size_t MAX_CAMERAS = 2;
+constexpr uint16_t INVALID_CONN_ID = 0xffff;
 constexpr uint64_t LOCATION_UPDATE_INTERVAL_US = 5000000ULL; // 5 seconds
-constexpr bool ENABLE_CAMERA_TIME_SYNC = false; // opt-in until real GNSS drives timezone
+constexpr uint64_t INTER_CAMERA_TX_GAP_US = 30000ULL;         // 30 ms
+constexpr bool ENABLE_CAMERA_TIME_SYNC = false;
 
 constexpr uint16_t SONY_COMPANY_ID = 0x012d;
 constexpr uint16_t SONY_CAMERA_TYPE = 0x0003;
 constexpr uint16_t APP_ID = 0;
-constexpr uint16_t UUID_DD11 = 0xdd11; // location update, write
-constexpr uint16_t UUID_DD21 = 0xdd21; // location configuration, read
-constexpr uint16_t UUID_DD30 = 0xdd30; // optional GPS enable/unlock
-constexpr uint16_t UUID_DD31 = 0xdd31; // optional GPS enable/lock
-constexpr uint16_t UUID_CC13 = 0xcc13; // optional camera local-time sync
+constexpr uint16_t UUID_DD11 = 0xdd11;
+constexpr uint16_t UUID_DD21 = 0xdd21;
+constexpr uint16_t UUID_DD30 = 0xdd30;
+constexpr uint16_t UUID_DD31 = 0xdd31;
+constexpr uint16_t UUID_CC13 = 0xcc13;
 
 // Canonical UUID: 8000dd00-dd00-ffff-ffff-ffffffffffff
 constexpr uint8_t GEO_SVC_UUID_LE[16] = {
@@ -101,7 +102,6 @@ static_assert(sizeof(SonyGeo95) == 95, "Sony GPS packet must be 95 bytes");
 
 enum class Stage : uint8_t {
   Boot,
-  Scanning,
   Connecting,
   Bonding,
   Mtu,
@@ -114,49 +114,70 @@ enum class Stage : uint8_t {
   Closing,
 };
 
-volatile Stage g_stage = Stage::Boot;
-volatile bool g_connected = false;
-volatile bool g_post_bond_started = false;
-volatile bool g_ready = false;
-volatile bool g_gatt_op_inflight = false;
-volatile bool g_tx_inflight = false;
+struct CameraSession {
+  bool allocated = false;
+  bool connected = false;
+  bool post_bond_started = false;
+  bool ready = false;
+  bool gatt_op_inflight = false;
+  bool tx_inflight = false;
+
+  Stage stage = Stage::Boot;
+  esp_bd_addr_t bda = {};
+  esp_ble_addr_type_t addr_type = BLE_ADDR_TYPE_PUBLIC;
+  uint16_t conn_id = INVALID_CONN_ID;
+
+  uint8_t protocol_version = 0;
+  uint8_t mode22 = 0;
+  uint16_t model = 0;
+  char name[40] = {};
+
+  uint32_t pair_attempt = 0;
+
+  uint16_t service_start = 0;
+  uint16_t service_end = 0;
+  uint16_t control_service_start = 0;
+  uint16_t control_service_end = 0;
+  uint16_t dd11 = 0;
+  uint16_t dd21 = 0;
+  uint16_t dd30 = 0;
+  uint16_t dd31 = 0;
+  uint16_t cc13 = 0;
+
+  bool send_timezone_dst = true;
+  uint64_t retry_due_us = 0;
+  uint64_t last_tx_us = 0;
+};
+
+CameraSession g_cameras[MAX_CAMERAS];
 
 esp_gatt_if_t g_gattc_if = ESP_GATT_IF_NONE;
-uint16_t g_conn_id = 0;
-esp_bd_addr_t g_camera_bda = {};
-esp_ble_addr_type_t g_camera_addr_type = BLE_ADDR_TYPE_PUBLIC;
-uint8_t g_protocol_version = 0;
-uint8_t g_mode22 = 0;
-
-uint32_t g_pair_attempt = 0;
-
-uint16_t g_service_start = 0;
-uint16_t g_service_end = 0;
-uint16_t g_control_service_start = 0;
-uint16_t g_control_service_end = 0;
-uint16_t g_dd11 = 0;
-uint16_t g_dd21 = 0;
-uint16_t g_dd30 = 0;
-uint16_t g_dd31 = 0;
-uint16_t g_cc13 = 0;
-volatile bool g_send_timezone_dst = true; // v6-compatible default until DD21 is parsed
-
-uint64_t g_rescan_due_us = 0;
-uint64_t g_last_tx_us = 0;
-
 esp_ble_scan_params_t g_scan_params{};
 
+bool g_scan_active = false;
+int g_opening_slot = -1;
+uint64_t g_scan_due_us = 0;
+
+int g_global_tx_slot = -1;
+uint64_t g_next_tx_allowed_us = 0;
+size_t g_tx_round_robin = 0;
+
 void startScan();
-void beginPostBond();
-void beginSonyFeatureHandshake();
-void sendTimeSyncOrReady();
-void markLocationReady();
-void closeAndRescan(const char* why, uint32_t delay_ms = 2500);
+void scheduleScan(uint32_t delay_ms = 0);
+void beginPostBond(size_t slot);
+void beginSonyFeatureHandshake(size_t slot);
+void sendTimeSyncOrReady(size_t slot);
+void markLocationReady(size_t slot);
+void closeAndRetry(size_t slot, const char* why, uint32_t delay_ms = 2500);
 void applySecurityProfile();
 
 void printAddr(const esp_bd_addr_t bda) {
   printf("%02X:%02X:%02X:%02X:%02X:%02X",
          bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+}
+
+void printCameraPrefix(size_t slot, const char* domain) {
+  printf("[C%u][%s] ", static_cast<unsigned>(slot + 1), domain);
 }
 
 const char* authFailToString(esp_ble_auth_fail_rsn_t reason) {
@@ -212,7 +233,53 @@ void printUuid(const esp_bt_uuid_t& uuid) {
   }
 }
 
-bool isCameraBonded() {
+int findSessionByBda(const esp_bd_addr_t bda) {
+  for (size_t i = 0; i < MAX_CAMERAS; ++i) {
+    if (g_cameras[i].allocated &&
+        memcmp(g_cameras[i].bda, bda, ESP_BD_ADDR_LEN) == 0) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+int findSessionByConnId(uint16_t conn_id) {
+  if (conn_id == INVALID_CONN_ID) return -1;
+  for (size_t i = 0; i < MAX_CAMERAS; ++i) {
+    if (g_cameras[i].allocated && g_cameras[i].connected &&
+        g_cameras[i].conn_id == conn_id) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+int findFreeSlot() {
+  for (size_t i = 0; i < MAX_CAMERAS; ++i) {
+    if (!g_cameras[i].allocated) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+size_t connectedCameraCount() {
+  size_t count = 0;
+  for (size_t i = 0; i < MAX_CAMERAS; ++i) {
+    if (g_cameras[i].allocated && g_cameras[i].connected) ++count;
+  }
+  return count;
+}
+
+bool scanStillUseful() {
+  if (connectedCameraCount() < MAX_CAMERAS) return true;
+  for (size_t i = 0; i < MAX_CAMERAS; ++i) {
+    if (g_cameras[i].allocated && !g_cameras[i].connected) return true;
+  }
+  return false;
+}
+
+bool isCameraBonded(const CameraSession& camera) {
+  if (!camera.allocated) return false;
+
   const int n = esp_ble_get_bond_device_num();
   if (n <= 0) return false;
 
@@ -224,7 +291,7 @@ bool isCameraBonded() {
   bool found = false;
   if (esp_ble_get_bond_device_list(&count, list) == ESP_OK) {
     for (int i = 0; i < count; ++i) {
-      if (memcmp(list[i].bd_addr, g_camera_bda, ESP_BD_ADDR_LEN) == 0) {
+      if (memcmp(list[i].bd_addr, camera.bda, ESP_BD_ADDR_LEN) == 0) {
         found = true;
         break;
       }
@@ -234,10 +301,11 @@ bool isCameraBonded() {
   return found;
 }
 
-bool resolveChar(uint16_t service_start, uint16_t service_end,
+bool resolveChar(const CameraSession& camera,
+                 uint16_t service_start, uint16_t service_end,
                  uint16_t uuid16, uint16_t* out_handle) {
-  if (!out_handle || g_gattc_if == ESP_GATT_IF_NONE || !g_connected ||
-      service_start == 0 || service_end == 0) {
+  if (!out_handle || g_gattc_if == ESP_GATT_IF_NONE || !camera.connected ||
+      camera.conn_id == INVALID_CONN_ID || service_start == 0 || service_end == 0) {
     return false;
   }
 
@@ -248,7 +316,8 @@ bool resolveChar(uint16_t service_start, uint16_t service_end,
   esp_gattc_char_elem_t elem{};
   uint16_t count = 1;
   const esp_gatt_status_t st = esp_ble_gattc_get_char_by_uuid(
-      g_gattc_if, g_conn_id, service_start, service_end, uuid, &elem, &count);
+      g_gattc_if, camera.conn_id, service_start, service_end,
+      uuid, &elem, &count);
   if (st != ESP_GATT_OK || count == 0) {
     *out_handle = 0;
     return false;
@@ -271,7 +340,8 @@ int64_t daysFromCivil(int year, unsigned month, unsigned day) {
   const int era = (year >= 0 ? year : year - 399) / 400;
   const unsigned yoe = static_cast<unsigned>(year - era * 400);
   const int adjusted_month = static_cast<int>(month) + (month > 2 ? -3 : 9);
-  const unsigned doy = (153u * static_cast<unsigned>(adjusted_month) + 2u) / 5u + day - 1u;
+  const unsigned doy =
+      (153u * static_cast<unsigned>(adjusted_month) + 2u) / 5u + day - 1u;
   const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
   return static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
 }
@@ -284,7 +354,7 @@ time_t makeUtcEpoch(int year, unsigned month, unsigned day,
 }
 
 int weekdaySundayZero(int year, unsigned month, unsigned day) {
-  int64_t w = (daysFromCivil(year, month, day) + 4) % 7; // 1970-01-01 = Thu(4)
+  int64_t w = (daysFromCivil(year, month, day) + 4) % 7;
   if (w < 0) w += 7;
   return static_cast<int>(w);
 }
@@ -332,7 +402,6 @@ bool dstActive(DstRule rule, int16_t standard_offset_minutes, time_t utc_epoch) 
     return utc_epoch >= start && utc_epoch < end;
   }
 
-  // Southern hemisphere: DST season crosses the year boundary.
   if (rule == DstRule::Nz) {
     const time_t end = makeUtcEpoch(y, 4, nthSunday(y, 4, 1), 3, 0, 0) -
                        static_cast<time_t>(standard_offset_minutes + 60) * 60;
@@ -364,16 +433,10 @@ bool inside(double lat, double lon, double south, double north,
   return lat >= south && lat <= north && lon >= west && lon <= east;
 }
 
-// Compact offline resolver intended for a stand-alone camera accessory. It
-// deliberately covers common travel regions with explicit rules and uses a
-// longitude-derived standard-offset fallback elsewhere. This is not a full
-// IANA timezone-boundary database; boundary areas can be approximate.
 TimeZoneInfo resolveTimeZone(double lat, double lon, time_t utc_epoch) {
-  // Antarctica / McMurdo follows New Zealand civil time.
   if (lat < -60.0 && lon >= 155.0 && lon <= 180.0)
     return makeTz("Antarctica/McMurdo", 720, DstRule::Nz, utc_epoch);
 
-  // East Asia and common nearby destinations.
   if (inside(lat, lon, 21.5, 25.6, 119.0, 122.5))
     return makeTz("Asia/Taipei", 480, DstRule::None, utc_epoch);
   if (inside(lat, lon, 22.0, 23.0, 113.6, 114.6))
@@ -391,11 +454,9 @@ TimeZoneInfo resolveTimeZone(double lat, double lon, time_t utc_epoch) {
   if (inside(lat, lon, 6.0, 37.5, 68.0, 97.5))
     return makeTz("Asia/Kolkata", 330, DstRule::None, utc_epoch, true);
 
-  // New Zealand.
   if (inside(lat, lon, -48.5, -33.0, 165.0, 180.0))
     return makeTz("Pacific/Auckland", 720, DstRule::Nz, utc_epoch);
 
-  // Australia. Ordered so Queensland/NT/WA no-DST regions win first.
   if (inside(lat, lon, -44.5, -10.0, 112.0, 129.0))
     return makeTz("Australia/Perth", 480, DstRule::None, utc_epoch, true);
   if (inside(lat, lon, -26.5, -10.0, 129.0, 138.5))
@@ -407,7 +468,6 @@ TimeZoneInfo resolveTimeZone(double lat, double lon, time_t utc_epoch) {
   if (inside(lat, lon, -44.5, -27.0, 140.5, 154.5))
     return makeTz("Australia/Sydney", 600, DstRule::Aus, utc_epoch, true);
 
-  // Europe: explicit UK/Portugal, then coarse Central/Eastern Europe bands.
   if (inside(lat, lon, 49.0, 61.5, -11.0, 2.5))
     return makeTz("Europe/London-Dublin", 0, DstRule::Eu, utc_epoch, true);
   if (inside(lat, lon, 36.0, 43.0, -10.0, -6.0))
@@ -419,7 +479,6 @@ TimeZoneInfo resolveTimeZone(double lat, double lon, time_t utc_epoch) {
   if (inside(lat, lon, 34.0, 71.5, 22.5, 40.0))
     return makeTz("Europe/Eastern", 120, DstRule::Eu, utc_epoch, true);
 
-  // United States: high-confidence special cases plus coarse continental bands.
   if (inside(lat, lon, 18.5, 22.5, -161.0, -154.0))
     return makeTz("Pacific/Honolulu", -600, DstRule::None, utc_epoch);
   if (inside(lat, lon, 51.0, 72.0, -170.0, -129.0))
@@ -429,12 +488,10 @@ TimeZoneInfo resolveTimeZone(double lat, double lon, time_t utc_epoch) {
   if (inside(lat, lon, 24.0, 50.0, -125.0, -66.0)) {
     if (lon < -114.0) return makeTz("US/Pacific", -480, DstRule::Us, utc_epoch, true);
     if (lon < -101.0) return makeTz("US/Mountain", -420, DstRule::Us, utc_epoch, true);
-    if (lon < -86.0)  return makeTz("US/Central", -360, DstRule::Us, utc_epoch, true);
+    if (lon < -86.0) return makeTz("US/Central", -360, DstRule::Us, utc_epoch, true);
     return makeTz("US/Eastern", -300, DstRule::Us, utc_epoch, true);
   }
 
-  // Compact fallback: nearest nominal 15-degree civil offset, no DST. This is
-  // deliberately marked approximate so logs reveal when no explicit region hit.
   int offset_hours = static_cast<int>((lon >= 0.0 ? lon + 7.5 : lon - 7.5) / 15.0);
   if (offset_hours < -12) offset_hours = -12;
   if (offset_hours > 14) offset_hours = 14;
@@ -452,13 +509,14 @@ TimeZoneInfo currentTimeZone(time_t utc_epoch) {
                          utc_epoch);
 }
 
-SonyGeo95 makeGeoPacket(time_t utc_epoch, const TimeZoneInfo& tz) {
+SonyGeo95 makeGeoPacket(bool send_timezone_dst,
+                        time_t utc_epoch, const TimeZoneInfo& tz) {
   SonyGeo95 geo{};
   const uint8_t prefix95[11] = {
       0x00, 0x5d, 0x08, 0x02, 0xfc, 0x03, 0x00, 0x00, 0x10, 0x10, 0x10};
   const uint8_t prefix91[11] = {
       0x00, 0x59, 0x08, 0x02, 0xfc, 0x00, 0x00, 0x00, 0x10, 0x10, 0x10};
-  memcpy(geo.prefix, g_send_timezone_dst ? prefix95 : prefix91, sizeof(geo.prefix));
+  memcpy(geo.prefix, send_timezone_dst ? prefix95 : prefix91, sizeof(geo.prefix));
 
   geo.latitude = static_cast<int32_t>(
       __builtin_bswap32(static_cast<uint32_t>(TEST_LAT_E7)));
@@ -481,7 +539,8 @@ SonyGeo95 makeGeoPacket(time_t utc_epoch, const TimeZoneInfo& tz) {
   return geo;
 }
 
-void buildTimeSyncPacket(uint8_t out[13], time_t utc_epoch, const TimeZoneInfo& tz) {
+void buildTimeSyncPacket(uint8_t out[13], time_t utc_epoch,
+                         const TimeZoneInfo& tz) {
   memset(out, 0, 13);
   const int32_t total_offset_seconds =
       static_cast<int32_t>(tz.standard_offset_minutes + tz.dst_offset_minutes) * 60;
@@ -510,44 +569,71 @@ void buildTimeSyncPacket(uint8_t out[13], time_t utc_epoch, const TimeZoneInfo& 
   out[12] = static_cast<uint8_t>(abs_standard % 60);
 }
 
-void resetConnectionState() {
-  g_connected = false;
-  g_post_bond_started = false;
-  g_ready = false;
-  g_gatt_op_inflight = false;
-  g_tx_inflight = false;
-  g_conn_id = 0;
-  g_service_start = 0;
-  g_service_end = 0;
-  g_control_service_start = 0;
-  g_control_service_end = 0;
-  g_dd11 = 0;
-  g_dd21 = 0;
-  g_dd30 = 0;
-  g_dd31 = 0;
-  g_cc13 = 0;
-  g_send_timezone_dst = true;
+void resetConnectionRuntime(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
+
+  if (g_global_tx_slot == static_cast<int>(slot)) {
+    g_global_tx_slot = -1;
+    g_next_tx_allowed_us = esp_timer_get_time() + INTER_CAMERA_TX_GAP_US;
+  }
+  if (g_opening_slot == static_cast<int>(slot)) {
+    g_opening_slot = -1;
+  }
+
+  camera.connected = false;
+  camera.post_bond_started = false;
+  camera.ready = false;
+  camera.gatt_op_inflight = false;
+  camera.tx_inflight = false;
+  camera.stage = Stage::Boot;
+  camera.conn_id = INVALID_CONN_ID;
+
+  camera.service_start = 0;
+  camera.service_end = 0;
+  camera.control_service_start = 0;
+  camera.control_service_end = 0;
+  camera.dd11 = 0;
+  camera.dd21 = 0;
+  camera.dd30 = 0;
+  camera.dd31 = 0;
+  camera.cc13 = 0;
+  camera.send_timezone_dst = true;
+  camera.last_tx_us = 0;
 }
 
-void scheduleRescan(uint32_t delay_ms) {
-  g_rescan_due_us = esp_timer_get_time() +
-                    static_cast<uint64_t>(delay_ms) * 1000ULL;
+void scheduleScan(uint32_t delay_ms) {
+  if (!scanStillUseful()) {
+    g_scan_due_us = 0;
+    return;
+  }
+
+  const uint64_t due = esp_timer_get_time() +
+                       static_cast<uint64_t>(delay_ms) * 1000ULL;
+  if (g_scan_due_us == 0 || due < g_scan_due_us) g_scan_due_us = due;
 }
 
-void closeAndRescan(const char* why, uint32_t delay_ms) {
-  printf("[BLE] %s\n", why ? why : "Closing connection");
-  g_ready = false;
-  g_stage = Stage::Closing;
-  scheduleRescan(delay_ms);
+void closeAndRetry(size_t slot, const char* why, uint32_t delay_ms) {
+  CameraSession& camera = g_cameras[slot];
+  printCameraPrefix(slot, "BLE");
+  printf("%s\n", why ? why : "Closing connection");
 
-  if (g_connected && g_gattc_if != ESP_GATT_IF_NONE) {
-    const esp_err_t err = esp_ble_gattc_close(g_gattc_if, g_conn_id);
+  camera.ready = false;
+  camera.stage = Stage::Closing;
+  camera.retry_due_us =
+      esp_timer_get_time() + static_cast<uint64_t>(delay_ms) * 1000ULL;
+
+  if (camera.connected && camera.conn_id != INVALID_CONN_ID &&
+      g_gattc_if != ESP_GATT_IF_NONE) {
+    const esp_err_t err = esp_ble_gattc_close(g_gattc_if, camera.conn_id);
     if (err != ESP_OK) {
-      printf("[BLE] esp_ble_gattc_close failed: %s\n", esp_err_to_name(err));
-      resetConnectionState();
+      printCameraPrefix(slot, "BLE");
+      printf("esp_ble_gattc_close failed: %s\n", esp_err_to_name(err));
+      resetConnectionRuntime(slot);
+      scheduleScan(delay_ms);
     }
   } else {
-    resetConnectionState();
+    resetConnectionRuntime(slot);
+    scheduleScan(delay_ms);
   }
 }
 
@@ -563,39 +649,84 @@ void setScanParamsAndStart() {
   const esp_err_t err = esp_ble_gap_set_scan_params(&g_scan_params);
   if (err != ESP_OK) {
     printf("[SCAN] set_scan_params failed: %s\n", esp_err_to_name(err));
-    scheduleRescan(2000);
+    scheduleScan(2000);
   }
 }
 
 void startScan() {
-  if (g_connected || g_stage == Stage::Connecting || g_stage == Stage::Bonding ||
-      g_stage == Stage::Mtu || g_stage == Stage::Discovering) {
+  if (!scanStillUseful() || g_scan_active || g_opening_slot >= 0) return;
+
+  const uint64_t now = esp_timer_get_time();
+
+  // If all known disconnected cameras are in retry backoff and no free slot
+  // exists, wait for the earliest backoff instead of spinning the scanner.
+  bool can_find_something_now = findFreeSlot() >= 0;
+  uint64_t earliest_retry = 0;
+  for (size_t i = 0; i < MAX_CAMERAS; ++i) {
+    const CameraSession& camera = g_cameras[i];
+    if (camera.allocated && !camera.connected) {
+      if (camera.retry_due_us == 0 || now >= camera.retry_due_us) {
+        can_find_something_now = true;
+      } else if (earliest_retry == 0 || camera.retry_due_us < earliest_retry) {
+        earliest_retry = camera.retry_due_us;
+      }
+    }
+  }
+  if (!can_find_something_now) {
+    g_scan_due_us = earliest_retry;
     return;
   }
 
-  g_rescan_due_us = 0;
-  g_stage = Stage::Scanning;
-  printf("[SCAN] Starting. For first-time pairing, put the camera into Bluetooth Pairing before this scan.\n");
+  g_scan_due_us = 0;
   const esp_err_t err = esp_ble_gap_start_scanning(15);
-  if (err != ESP_OK) {
+  if (err == ESP_OK) {
+    g_scan_active = true;
+    printf("[SCAN] Starting multi-camera discovery (%u/%u connected).\n",
+           static_cast<unsigned>(connectedCameraCount()),
+           static_cast<unsigned>(MAX_CAMERAS));
+  } else {
     printf("[SCAN] start failed: %s\n", esp_err_to_name(err));
-    scheduleRescan(2000);
+    scheduleScan(2000);
   }
 }
 
-void openCamera(const esp_ble_gap_cb_param_t::ble_scan_result_evt_param& r) {
-  memcpy(g_camera_bda, r.bda, ESP_BD_ADDR_LEN);
-  g_camera_addr_type = r.ble_addr_type;
-  g_stage = Stage::Connecting;
-  esp_ble_gap_stop_scanning();
+void populateSessionFromAdvertisement(size_t slot,
+                                      const esp_ble_gap_cb_param_t::ble_scan_result_evt_param& r,
+                                      const SonyAdv& adv,
+                                      const char* name) {
+  CameraSession& camera = g_cameras[slot];
+  if (!camera.allocated) {
+    camera.allocated = true;
+    memcpy(camera.bda, r.bda, ESP_BD_ADDR_LEN);
+  }
+  camera.addr_type = r.ble_addr_type;
+  camera.protocol_version = adv.protocol_version;
+  camera.mode22 = adv.mode22;
+  camera.model = adv.model;
+  if (name) {
+    strncpy(camera.name, name, sizeof(camera.name) - 1);
+    camera.name[sizeof(camera.name) - 1] = '\0';
+  }
+}
 
-  printf("[BLE] Connecting to ");
-  printAddr(g_camera_bda);
+void openCamera(size_t slot,
+                const esp_ble_gap_cb_param_t::ble_scan_result_evt_param& r) {
+  CameraSession& camera = g_cameras[slot];
+  camera.stage = Stage::Connecting;
+  g_opening_slot = static_cast<int>(slot);
+
+  if (g_scan_active) {
+    esp_ble_gap_stop_scanning();
+  }
+
+  printCameraPrefix(slot, "BLE");
+  printf("Connecting to ");
+  printAddr(camera.bda);
   printf(" using Bluedroid\n");
 
   esp_ble_gatt_creat_conn_params_t cp{};
-  memcpy(cp.remote_bda, g_camera_bda, ESP_BD_ADDR_LEN);
-  cp.remote_addr_type = g_camera_addr_type;
+  memcpy(cp.remote_bda, camera.bda, ESP_BD_ADDR_LEN);
+  cp.remote_addr_type = camera.addr_type;
   cp.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
   cp.is_direct = true;
   cp.is_aux = false;
@@ -603,91 +734,116 @@ void openCamera(const esp_ble_gap_cb_param_t::ble_scan_result_evt_param& r) {
 
   const esp_err_t err = esp_ble_gattc_enh_open(g_gattc_if, &cp);
   if (err != ESP_OK) {
-    printf("[BLE] open failed immediately: %s\n", esp_err_to_name(err));
-    resetConnectionState();
-    g_stage = Stage::Boot;
-    scheduleRescan(2500);
+    printCameraPrefix(slot, "BLE");
+    printf("open failed immediately: %s\n", esp_err_to_name(err));
+    g_opening_slot = -1;
+    resetConnectionRuntime(slot);
+    camera.retry_due_us = esp_timer_get_time() + 2500000ULL;
+    scheduleScan(2500);
   }
 }
 
-void startBondNow() {
-  if (!g_connected) return;
-  g_stage = Stage::Bonding;
-  ++g_pair_attempt;
+void startBondNow(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
+  if (!camera.connected) return;
 
-  printf("[PAIR] BOND-FIRST v7 attempt #%" PRIu32 " profile=GATTS+SC_CAPABLE_BOND\n",
-         g_pair_attempt);
-  printf("[PAIR] No MTU exchange, Sony service discovery, EE01, DD21 or DD11 has been attempted yet.\n");
-  printf("[PAIR] GATT Server support is ENABLED so Sony can read this C6's Generic Access / Device Name.\n");
-  printf("[PAIR] local bond before request=%d\n", isCameraBonded() ? 1 : 0);
-  printf("[PAIR] Watch the camera screen and press OK if it shows 'SonyGPS-C6-v7'.\n");
+  camera.stage = Stage::Bonding;
+  ++camera.pair_attempt;
 
-  const esp_err_t err = esp_ble_set_encryption(g_camera_bda, ESP_BLE_SEC_ENCRYPT);
-  printf("[PAIR] esp_ble_set_encryption(ESP_BLE_SEC_ENCRYPT) -> %s\n",
+  printCameraPrefix(slot, "PAIR");
+  printf("BOND-FIRST multi-camera attempt #%" PRIu32
+         " profile=GATTS+SC_CAPABLE_BOND\n", camera.pair_attempt);
+  printCameraPrefix(slot, "PAIR");
+  printf("local bond before request=%d\n", isCameraBonded(camera) ? 1 : 0);
+
+  const esp_err_t err =
+      esp_ble_set_encryption(camera.bda, ESP_BLE_SEC_ENCRYPT);
+  printCameraPrefix(slot, "PAIR");
+  printf("esp_ble_set_encryption(ESP_BLE_SEC_ENCRYPT) -> %s\n",
          esp_err_to_name(err));
   if (err != ESP_OK) {
-    closeAndRescan("[PAIR] could not start bond/encryption", 3000);
+    closeAndRetry(slot, "[PAIR] could not start bond/encryption", 3000);
   }
 }
 
-void beginPostBond() {
-  if (!g_connected || g_post_bond_started) return;
-  g_post_bond_started = true;
-  g_stage = Stage::Mtu;
+void beginPostBond(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
+  if (!camera.connected || camera.post_bond_started) return;
 
-  printf("[PAIR] Bond/encryption established. local bond now=%d\n",
-         isCameraBonded() ? 1 : 0);
-  printf("[GATT] Now requesting MTU -- this is the FIRST post-bond GATT setup step.\n");
+  camera.post_bond_started = true;
+  camera.stage = Stage::Mtu;
 
-  const esp_err_t err = esp_ble_gattc_send_mtu_req(g_gattc_if, g_conn_id);
+  printCameraPrefix(slot, "PAIR");
+  printf("Bond/encryption established. local bond now=%d\n",
+         isCameraBonded(camera) ? 1 : 0);
+  printCameraPrefix(slot, "GATT");
+  printf("Requesting MTU after bond.\n");
+
+  const esp_err_t err =
+      esp_ble_gattc_send_mtu_req(g_gattc_if, camera.conn_id);
   if (err != ESP_OK) {
-    printf("[GATT] MTU request could not be submitted: %s\n", esp_err_to_name(err));
-    printf("[GATT] Continuing directly to Sony DD00/CC00 service discovery.\n");
-    g_stage = Stage::Discovering;
-    esp_ble_gattc_search_service(g_gattc_if, g_conn_id, nullptr);
+    printCameraPrefix(slot, "GATT");
+    printf("MTU request submit failed: %s; continuing to service discovery.\n",
+           esp_err_to_name(err));
+    camera.stage = Stage::Discovering;
+    esp_ble_gattc_search_service(g_gattc_if, camera.conn_id, nullptr);
   }
 }
 
-void readDd21Config() {
-  if (!g_connected || g_dd21 == 0 || g_gatt_op_inflight) {
-    beginSonyFeatureHandshake();
+void readDd21Config(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
+  if (!camera.connected || camera.dd21 == 0 || camera.gatt_op_inflight) {
+    beginSonyFeatureHandshake(slot);
     return;
   }
 
-  g_stage = Stage::ReadConfig;
-  g_gatt_op_inflight = true;
-  printf("[GEO] Reading DD21 location configuration.\n");
+  camera.stage = Stage::ReadConfig;
+  camera.gatt_op_inflight = true;
+  printCameraPrefix(slot, "GEO");
+  printf("Reading DD21 location configuration.\n");
+
   const esp_err_t err = esp_ble_gattc_read_char(
-      g_gattc_if, g_conn_id, g_dd21, ESP_GATT_AUTH_REQ_NONE);
+      g_gattc_if, camera.conn_id, camera.dd21, ESP_GATT_AUTH_REQ_NONE);
   if (err != ESP_OK) {
-    g_gatt_op_inflight = false;
-    printf("[GEO] DD21 read submission failed: %s; keeping 95-byte v6-compatible default.\n",
+    camera.gatt_op_inflight = false;
+    printCameraPrefix(slot, "GEO");
+    printf("DD21 read submit failed: %s; keeping 95-byte default.\n",
            esp_err_to_name(err));
-    beginSonyFeatureHandshake();
+    beginSonyFeatureHandshake(slot);
   }
 }
 
-bool submitHandshakeWrite(uint16_t handle, const uint8_t* data, uint16_t len,
+bool submitHandshakeWrite(size_t slot, uint16_t handle,
+                          const uint8_t* data, uint16_t len,
                           Stage stage, const char* label) {
-  if (!g_connected || handle == 0 || g_gatt_op_inflight) return false;
-  g_stage = stage;
-  g_gatt_op_inflight = true;
+  CameraSession& camera = g_cameras[slot];
+  if (!camera.connected || handle == 0 || camera.gatt_op_inflight) return false;
+
+  camera.stage = stage;
+  camera.gatt_op_inflight = true;
   const esp_err_t err = esp_ble_gattc_write_char(
-      g_gattc_if, g_conn_id, handle, len, const_cast<uint8_t*>(data),
+      g_gattc_if, camera.conn_id, handle, len, const_cast<uint8_t*>(data),
       ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
   if (err != ESP_OK) {
-    g_gatt_op_inflight = false;
-    printf("[GATT] %s submit failed: %s\n", label, esp_err_to_name(err));
+    camera.gatt_op_inflight = false;
+    printCameraPrefix(slot, "GATT");
+    printf("%s submit failed: %s\n", label, esp_err_to_name(err));
     return false;
   }
-  printf("[GATT] %s submitted to handle 0x%04x.\n", label, handle);
+
+  printCameraPrefix(slot, "GATT");
+  printf("%s submitted to handle 0x%04x.\n", label, handle);
   return true;
 }
 
-void sendTimeSyncOrReady() {
-  if (!ENABLE_CAMERA_TIME_SYNC || g_cc13 == 0) {
-    if (ENABLE_CAMERA_TIME_SYNC) printf("[TIME] CC13 not exposed; camera clock sync skipped.\n");
-    markLocationReady();
+void sendTimeSyncOrReady(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
+  if (!ENABLE_CAMERA_TIME_SYNC || camera.cc13 == 0) {
+    if (ENABLE_CAMERA_TIME_SYNC && camera.cc13 == 0) {
+      printCameraPrefix(slot, "TIME");
+      printf("CC13 not exposed; camera clock sync skipped.\n");
+    }
+    markLocationReady(slot);
     return;
   }
 
@@ -695,89 +851,124 @@ void sendTimeSyncOrReady() {
   const TimeZoneInfo tz = currentTimeZone(utc);
   uint8_t packet[13]{};
   buildTimeSyncPacket(packet, utc, tz);
-  printf("[TIME] timezone=%s standard=%dmin dst=%dmin%s\n",
+
+  printCameraPrefix(slot, "TIME");
+  printf("timezone=%s standard=%dmin dst=%dmin%s\n",
          tz.name, tz.standard_offset_minutes, tz.dst_offset_minutes,
          tz.approximate ? " (approx boundary resolver)" : "");
-  if (!submitHandshakeWrite(g_cc13, packet, sizeof(packet), Stage::SyncTime,
-                            "CC13 camera time sync")) {
-    markLocationReady();
+
+  if (!submitHandshakeWrite(slot, camera.cc13, packet, sizeof(packet),
+                            Stage::SyncTime, "CC13 camera time sync")) {
+    markLocationReady(slot);
   }
 }
 
-void beginSonyFeatureHandshake() {
+void beginSonyFeatureHandshake(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
   static const uint8_t enable = 0x01;
-  if (g_dd30 != 0) {
-    if (submitHandshakeWrite(g_dd30, &enable, 1, Stage::EnableUnlock,
-                             "DD30 GPS enable/unlock")) return;
+
+  if (camera.dd30 != 0) {
+    if (submitHandshakeWrite(slot, camera.dd30, &enable, 1,
+                             Stage::EnableUnlock,
+                             "DD30 GPS enable/unlock")) {
+      return;
+    }
   }
-  if (g_dd31 != 0) {
-    if (submitHandshakeWrite(g_dd31, &enable, 1, Stage::EnableLock,
-                             "DD31 GPS enable/lock")) return;
+  if (camera.dd31 != 0) {
+    if (submitHandshakeWrite(slot, camera.dd31, &enable, 1,
+                             Stage::EnableLock,
+                             "DD31 GPS enable/lock")) {
+      return;
+    }
   }
-  sendTimeSyncOrReady();
+  sendTimeSyncOrReady(slot);
 }
 
-void markLocationReady() {
-  g_stage = Stage::Ready;
-  g_ready = true;
-  g_last_tx_us = 0;
-  printf("[GEO] Sony Location path READY. DD11=0x%04x; packet=%u bytes.\n",
-         g_dd11, g_send_timezone_dst ? 95u : 91u);
-  printf("[GEO] Static E7 test fix will be sent every 5 seconds.\n");
+void markLocationReady(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
+  camera.stage = Stage::Ready;
+  camera.ready = true;
+  camera.last_tx_us = 0;
+
+  printCameraPrefix(slot, "GEO");
+  printf("Sony Location path READY. DD11=0x%04x; packet=%u bytes.\n",
+         camera.dd11, camera.send_timezone_dst ? 95u : 91u);
+
+  // Once one camera is stable, discover the next one while keeping this
+  // connection alive. Discovery/setup is serialized one camera at a time.
+  scheduleScan(250);
 }
 
-void sendStaticLocation() {
-  if (!g_connected || !g_ready || g_dd11 == 0 ||
-      g_tx_inflight || g_gatt_op_inflight) {
+void sendStaticLocation(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
+  if (!camera.connected || !camera.ready || camera.dd11 == 0 ||
+      camera.tx_inflight || camera.gatt_op_inflight ||
+      g_global_tx_slot >= 0) {
     return;
   }
 
   const time_t utc = currentTestUtc();
   const TimeZoneInfo tz = currentTimeZone(utc);
-  SonyGeo95 geo = makeGeoPacket(utc, tz);
-  const uint16_t packet_len = g_send_timezone_dst ? 95 : 91;
-  g_tx_inflight = true;
+  SonyGeo95 geo = makeGeoPacket(camera.send_timezone_dst, utc, tz);
+  const uint16_t packet_len = camera.send_timezone_dst ? 95 : 91;
+
+  camera.tx_inflight = true;
+  g_global_tx_slot = static_cast<int>(slot);
+
   const esp_err_t err = esp_ble_gattc_write_char(
-      g_gattc_if, g_conn_id, g_dd11, packet_len,
+      g_gattc_if, camera.conn_id, camera.dd11, packet_len,
       reinterpret_cast<uint8_t*>(&geo),
       ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
   if (err != ESP_OK) {
-    g_tx_inflight = false;
-    printf("[TX] submit failed: %s\n", esp_err_to_name(err));
+    camera.tx_inflight = false;
+    g_global_tx_slot = -1;
+    g_next_tx_allowed_us = esp_timer_get_time() + INTER_CAMERA_TX_GAP_US;
+    printCameraPrefix(slot, "TX");
+    printf("submit failed: %s\n", esp_err_to_name(err));
   }
 }
 
-void handleDiscoveryComplete() {
-  if (g_service_start == 0 || g_service_end == 0) {
-    closeAndRescan("[GATT] Sony Location service DD00 not found");
+void handleDiscoveryComplete(size_t slot) {
+  CameraSession& camera = g_cameras[slot];
+
+  if (camera.service_start == 0 || camera.service_end == 0) {
+    closeAndRetry(slot, "[GATT] Sony Location service DD00 not found", 2500);
     return;
   }
 
-  const bool has11 = resolveChar(g_service_start, g_service_end, UUID_DD11, &g_dd11);
-  const bool has21 = resolveChar(g_service_start, g_service_end, UUID_DD21, &g_dd21);
-  const bool has30 = resolveChar(g_service_start, g_service_end, UUID_DD30, &g_dd30);
-  const bool has31 = resolveChar(g_service_start, g_service_end, UUID_DD31, &g_dd31);
-  const bool has13 = resolveChar(g_control_service_start, g_control_service_end, UUID_CC13, &g_cc13);
+  const bool has11 = resolveChar(
+      camera, camera.service_start, camera.service_end, UUID_DD11, &camera.dd11);
+  const bool has21 = resolveChar(
+      camera, camera.service_start, camera.service_end, UUID_DD21, &camera.dd21);
+  const bool has30 = resolveChar(
+      camera, camera.service_start, camera.service_end, UUID_DD30, &camera.dd30);
+  const bool has31 = resolveChar(
+      camera, camera.service_start, camera.service_end, UUID_DD31, &camera.dd31);
+  const bool has13 = resolveChar(
+      camera, camera.control_service_start, camera.control_service_end,
+      UUID_CC13, &camera.cc13);
 
-  printf("[GATT] DD11=%s(0x%04x) DD21=%s(0x%04x) DD30=%s DD31=%s CC13=%s\n",
-         has11 ? "FOUND" : "missing", g_dd11,
-         has21 ? "FOUND" : "missing", g_dd21,
+  printCameraPrefix(slot, "GATT");
+  printf("DD11=%s(0x%04x) DD21=%s(0x%04x) DD30=%s DD31=%s CC13=%s\n",
+         has11 ? "FOUND" : "missing", camera.dd11,
+         has21 ? "FOUND" : "missing", camera.dd21,
          has30 ? "FOUND" : "missing",
          has31 ? "FOUND" : "missing",
          has13 ? "FOUND" : "missing");
 
   if (!has11) {
-    closeAndRescan("[GATT] Required Sony DD11 location characteristic missing");
+    closeAndRetry(slot, "[GATT] Required Sony DD11 characteristic missing", 2500);
     return;
   }
 
   if (has21) {
-    g_send_timezone_dst = true; // preserve v6 behavior if the read itself fails
-    readDd21Config();
+    camera.send_timezone_dst = true;
+    readDd21Config(slot);
   } else {
-    g_send_timezone_dst = false;
-    printf("[GEO] DD21 absent: using 91-byte packet without timezone/DST fields.\n");
-    beginSonyFeatureHandshake();
+    camera.send_timezone_dst = false;
+    printCameraPrefix(slot, "GEO");
+    printf("DD21 absent: using 91-byte packet without timezone/DST fields.\n");
+    beginSonyFeatureHandshake(slot);
   }
 }
 
@@ -785,11 +976,11 @@ void gapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
   switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
       if (param->scan_param_cmpl.status == ESP_BT_STATUS_SUCCESS) {
-        startScan();
+        scheduleScan(0);
       } else {
         printf("[SCAN] parameter setup failed, status=%d\n",
                param->scan_param_cmpl.status);
-        scheduleRescan(2000);
+        scheduleScan(2000);
       }
       break;
 
@@ -797,56 +988,85 @@ void gapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
       printf("[SCAN] start %s (status=%d)\n",
              param->scan_start_cmpl.status == ESP_BT_STATUS_SUCCESS ? "OK" : "FAIL",
              param->scan_start_cmpl.status);
+      if (param->scan_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+        g_scan_active = false;
+        scheduleScan(2000);
+      }
       break;
 
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
       auto& r = param->scan_rst;
-      if (r.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT && g_stage == Stage::Scanning) {
-        const uint16_t total_len = static_cast<uint16_t>(r.adv_data_len + r.scan_rsp_len);
+
+      if (r.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
+        const uint16_t total_len =
+            static_cast<uint16_t>(r.adv_data_len + r.scan_rsp_len);
         uint8_t mfg_len = 0;
         uint8_t* mfg = esp_ble_resolve_adv_data_by_type(
-            r.ble_adv, total_len, ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE, &mfg_len);
+            r.ble_adv, total_len,
+            ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE, &mfg_len);
+
         if (mfg && mfg_len >= sizeof(SonyAdv)) {
           SonyAdv adv{};
           memcpy(&adv, mfg, sizeof(adv));
-          if (adv.company_id == SONY_COMPANY_ID && adv.type == SONY_CAMERA_TYPE) {
+          if (adv.company_id == SONY_COMPANY_ID &&
+              adv.type == SONY_CAMERA_TYPE) {
             uint8_t name_len = 0;
             uint8_t* name = esp_ble_resolve_adv_data_by_type(
                 r.ble_adv, total_len, ESP_BLE_AD_TYPE_NAME_CMPL, &name_len);
             char name_buf[40] = {};
             if (name && name_len) {
-              const size_t n = name_len < sizeof(name_buf) - 1 ?
-                               name_len : sizeof(name_buf) - 1;
+              const size_t n = name_len < sizeof(name_buf) - 1
+                                   ? name_len
+                                   : sizeof(name_buf) - 1;
               memcpy(name_buf, name, n);
             }
 
-            g_protocol_version = adv.protocol_version;
-            g_mode22 = adv.mode22;
-            printf("[SCAN] Sony camera found: name='%s' addr=", name_buf);
+            int slot = findSessionByBda(r.bda);
+            if (slot >= 0) {
+              CameraSession& camera = g_cameras[slot];
+              if (camera.connected ||
+                  camera.stage == Stage::Connecting ||
+                  camera.stage == Stage::Bonding ||
+                  esp_timer_get_time() < camera.retry_due_us) {
+                break;
+              }
+            } else {
+              slot = findFreeSlot();
+              if (slot < 0) break;
+            }
+
+            populateSessionFromAdvertisement(
+                static_cast<size_t>(slot), r, adv, name_buf);
+
+            printCameraPrefix(static_cast<size_t>(slot), "SCAN");
+            printf("Sony camera found: name='%s' addr=", name_buf);
             printAddr(r.bda);
-            printf(" proto=%u(0x%02x) mode22=0x%02x bit0x40=%d model=0x%04x RSSI=%d\n",
-                   static_cast<unsigned>(adv.protocol_version), adv.protocol_version,
-                   adv.mode22, (adv.mode22 & 0x40) ? 1 : 0,
-                   adv.model, r.rssi);
-            printf("[SCAN] NOTE: mode22 is logged raw; no single bit is treated as proof of a completed local bond.\n");
-            openCamera(r);
+            printf(" proto=%u(0x%02x) mode22=0x%02x bit0x40=%d "
+                   "model=0x%04x RSSI=%d\n",
+                   static_cast<unsigned>(adv.protocol_version),
+                   adv.protocol_version, adv.mode22,
+                   (adv.mode22 & 0x40) ? 1 : 0, adv.model, r.rssi);
+            printCameraPrefix(static_cast<size_t>(slot), "SCAN");
+            printf("mode22 is logged raw; no single bit is treated as proof of bond state.\n");
+
+            openCamera(static_cast<size_t>(slot), r);
           }
         }
-      } else if (r.search_evt == ESP_GAP_SEARCH_INQ_CMPL_EVT &&
-                 g_stage == Stage::Scanning) {
-        printf("[SCAN] ended without connection. Retrying in 3 seconds.\n");
-        g_stage = Stage::Boot;
-        scheduleRescan(3000);
+      } else if (r.search_evt == ESP_GAP_SEARCH_INQ_CMPL_EVT) {
+        g_scan_active = false;
+        printf("[SCAN] discovery window ended.\n");
+        scheduleScan(3000);
       }
       break;
     }
 
     case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+      g_scan_active = false;
       printf("[SCAN] stop status=%d\n", param->scan_stop_cmpl.status);
       break;
 
     case ESP_GAP_BLE_SEC_REQ_EVT:
-      printf("[PAIR] ESP_GAP_BLE_SEC_REQ_EVT from Sony -> ACCEPT\n");
+      printf("[PAIR] ESP_GAP_BLE_SEC_REQ_EVT -> ACCEPT\n");
       esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
       break;
 
@@ -862,7 +1082,7 @@ void gapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
       break;
 
     case ESP_GAP_BLE_PASSKEY_REQ_EVT:
-      printf("[PAIR] PASSKEY_REQ received. NoInputNoOutput was configured; not supplying a passkey.\n");
+      printf("[PAIR] PASSKEY_REQ received; NoInputNoOutput configured.\n");
       break;
 
     case ESP_GAP_BLE_KEY_EVT:
@@ -871,19 +1091,28 @@ void gapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
       break;
 
     case ESP_GAP_BLE_AUTH_CMPL_EVT: {
-      const auto& a = param->ble_security.auth_cmpl;
-      printf("[PAIR] Authentication complete: success=%d addr=", a.success ? 1 : 0);
-      printAddr(a.bd_addr);
-      printf(" auth_mode=0x%02x", static_cast<unsigned>(a.auth_mode));
-      if (!a.success) {
+      const auto& auth = param->ble_security.auth_cmpl;
+      const int slot = findSessionByBda(auth.bd_addr);
+
+      printf("[PAIR] Authentication complete: success=%d addr=",
+             auth.success ? 1 : 0);
+      printAddr(auth.bd_addr);
+      printf(" auth_mode=0x%02x", static_cast<unsigned>(auth.auth_mode));
+
+      if (slot < 0) {
+        printf(" -> no active camera session\n");
+        break;
+      }
+
+      if (!auth.success) {
         printf(" fail_reason=0x%02x (%s)\n",
-               static_cast<unsigned>(a.fail_reason),
-               authFailToString(a.fail_reason));
-        printf("[PAIR] v7 fixed SC-capable profile failed; reconnecting with the same known-good profile.\n");
-        closeAndRescan("[PAIR] bond-first SMP failed", 3500);
+               static_cast<unsigned>(auth.fail_reason),
+               authFailToString(auth.fail_reason));
+        closeAndRetry(static_cast<size_t>(slot),
+                      "[PAIR] SMP failed; retrying same profile", 3500);
       } else {
         printf(" -> BONDED/ENCRYPTED\n");
-        beginPostBond();
+        beginPostBond(static_cast<size_t>(slot));
       }
       break;
     }
@@ -909,135 +1138,239 @@ void gattcCallback(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
   }
 
   switch (event) {
-    case ESP_GATTC_CONNECT_EVT:
-      printf("[BLE] Connected event: conn_id=%u remote=",
-             param->connect.conn_id);
+    case ESP_GATTC_CONNECT_EVT: {
+      const int slot = findSessionByBda(param->connect.remote_bda);
+      if (slot >= 0) printCameraPrefix(static_cast<size_t>(slot), "BLE");
+      else printf("[BLE] ");
+      printf("Connected event: conn_id=%u remote=", param->connect.conn_id);
       printAddr(param->connect.remote_bda);
       printf("\n");
       break;
+    }
 
-    case ESP_GATTC_OPEN_EVT:
-      if (param->open.status != ESP_GATT_OK) {
-        printf("[BLE] Open failed, status=0x%x\n", param->open.status);
-        resetConnectionState();
-        g_stage = Stage::Boot;
-        scheduleRescan(2500);
+    case ESP_GATTC_OPEN_EVT: {
+      int slot = findSessionByBda(param->open.remote_bda);
+      if (slot < 0) slot = g_opening_slot;
+
+      if (slot < 0) {
+        printf("[BLE] Open event for unknown camera, status=0x%x\n",
+               param->open.status);
         break;
       }
 
-      g_connected = true;
-      g_conn_id = param->open.conn_id;
-      memcpy(g_camera_bda, param->open.remote_bda, ESP_BD_ADDR_LEN);
-      printf("[BLE] Open OK. conn_id=%u MTU(initial)=%u\n",
-             g_conn_id, param->open.mtu);
-      startBondNow();
-      break;
+      CameraSession& camera = g_cameras[slot];
+      g_opening_slot = -1;
 
-    case ESP_GATTC_CFG_MTU_EVT:
-      printf("[GATT] MTU exchange: status=%d MTU=%u\n",
+      if (param->open.status != ESP_GATT_OK) {
+        printCameraPrefix(static_cast<size_t>(slot), "BLE");
+        printf("Open failed, status=0x%x\n", param->open.status);
+        resetConnectionRuntime(static_cast<size_t>(slot));
+        camera.retry_due_us = esp_timer_get_time() + 2500000ULL;
+        scheduleScan(2500);
+        break;
+      }
+
+      camera.connected = true;
+      camera.conn_id = param->open.conn_id;
+      memcpy(camera.bda, param->open.remote_bda, ESP_BD_ADDR_LEN);
+      camera.retry_due_us = 0;
+
+      printCameraPrefix(static_cast<size_t>(slot), "BLE");
+      printf("Open OK. conn_id=%u MTU(initial)=%u\n",
+             camera.conn_id, param->open.mtu);
+
+      startBondNow(static_cast<size_t>(slot));
+      break;
+    }
+
+    case ESP_GATTC_CFG_MTU_EVT: {
+      const int slot = findSessionByConnId(param->cfg_mtu.conn_id);
+      if (slot < 0) break;
+      CameraSession& camera = g_cameras[slot];
+
+      printCameraPrefix(static_cast<size_t>(slot), "GATT");
+      printf("MTU exchange: status=%d MTU=%u\n",
              param->cfg_mtu.status, param->cfg_mtu.mtu);
-      printf("[GATT] Discovering Sony DD00 Location and CC00 Control services AFTER bond...\n");
-      g_stage = Stage::Discovering;
-      esp_ble_gattc_search_service(gattc_if, param->cfg_mtu.conn_id, nullptr);
+      camera.stage = Stage::Discovering;
+      esp_ble_gattc_search_service(
+          gattc_if, camera.conn_id, nullptr);
       break;
+    }
 
-    case ESP_GATTC_SEARCH_RES_EVT:
+    case ESP_GATTC_SEARCH_RES_EVT: {
+      const int slot = findSessionByConnId(param->search_res.conn_id);
+      if (slot < 0) break;
+      CameraSession& camera = g_cameras[slot];
+
       if (isGeoServiceUuid(param->search_res.srvc_id.uuid)) {
-        g_service_start = param->search_res.start_handle;
-        g_service_end = param->search_res.end_handle;
-        printf("[GATT] Sony Location service DD00 FOUND: handles 0x%04x..0x%04x uuid_raw=",
-               g_service_start, g_service_end);
+        camera.service_start = param->search_res.start_handle;
+        camera.service_end = param->search_res.end_handle;
+        printCameraPrefix(static_cast<size_t>(slot), "GATT");
+        printf("Sony Location service DD00 FOUND: handles 0x%04x..0x%04x uuid_raw=",
+               camera.service_start, camera.service_end);
         printUuid(param->search_res.srvc_id.uuid);
         printf("\n");
       } else if (isControlServiceUuid(param->search_res.srvc_id.uuid)) {
-        g_control_service_start = param->search_res.start_handle;
-        g_control_service_end = param->search_res.end_handle;
-        printf("[GATT] Sony Control service CC00 FOUND: handles 0x%04x..0x%04x uuid_raw=",
-               g_control_service_start, g_control_service_end);
+        camera.control_service_start = param->search_res.start_handle;
+        camera.control_service_end = param->search_res.end_handle;
+        printCameraPrefix(static_cast<size_t>(slot), "GATT");
+        printf("Sony Control service CC00 FOUND: handles 0x%04x..0x%04x uuid_raw=",
+               camera.control_service_start, camera.control_service_end);
         printUuid(param->search_res.srvc_id.uuid);
         printf("\n");
       }
       break;
+    }
 
-    case ESP_GATTC_SEARCH_CMPL_EVT:
-      printf("[GATT] Service discovery complete: status=0x%x\n",
+    case ESP_GATTC_SEARCH_CMPL_EVT: {
+      const int slot = findSessionByConnId(param->search_cmpl.conn_id);
+      if (slot < 0) break;
+
+      printCameraPrefix(static_cast<size_t>(slot), "GATT");
+      printf("Service discovery complete: status=0x%x\n",
              param->search_cmpl.status);
       if (param->search_cmpl.status != ESP_GATT_OK) {
-        closeAndRescan("[GATT] service discovery failed");
+        closeAndRetry(static_cast<size_t>(slot),
+                      "[GATT] service discovery failed", 2500);
       } else {
-        handleDiscoveryComplete();
+        handleDiscoveryComplete(static_cast<size_t>(slot));
       }
       break;
+    }
 
-    case ESP_GATTC_READ_CHAR_EVT:
-      g_gatt_op_inflight = false;
-      printf("[GATT] READ handle=0x%04x status=0x%x len=%u\n",
+    case ESP_GATTC_READ_CHAR_EVT: {
+      const int slot = findSessionByConnId(param->read.conn_id);
+      if (slot < 0) break;
+      CameraSession& camera = g_cameras[slot];
+
+      camera.gatt_op_inflight = false;
+      printCameraPrefix(static_cast<size_t>(slot), "GATT");
+      printf("READ handle=0x%04x status=0x%x len=%u\n",
              param->read.handle, param->read.status, param->read.value_len);
-      if (param->read.handle == g_dd21 && g_stage == Stage::ReadConfig) {
+
+      if (param->read.handle == camera.dd21 &&
+          camera.stage == Stage::ReadConfig) {
         if (param->read.status == ESP_GATT_OK) {
-          printf("[GEO] DD21 config:");
-          for (uint16_t i = 0; i < param->read.value_len; ++i) printf(" %02x", param->read.value[i]);
+          printCameraPrefix(static_cast<size_t>(slot), "GEO");
+          printf("DD21 config:");
+          for (uint16_t i = 0; i < param->read.value_len; ++i) {
+            printf(" %02x", param->read.value[i]);
+          }
           printf("\n");
-          g_send_timezone_dst = param->read.value_len >= 5 &&
-                                (param->read.value[4] & 0x02) != 0;
-          printf("[GEO] DD21 timezone/DST flag=%d -> packet=%u bytes.\n",
-                 g_send_timezone_dst ? 1 : 0, g_send_timezone_dst ? 95u : 91u);
+
+          camera.send_timezone_dst =
+              param->read.value_len >= 5 &&
+              (param->read.value[4] & 0x02) != 0;
+
+          printCameraPrefix(static_cast<size_t>(slot), "GEO");
+          printf("DD21 timezone/DST flag=%d -> packet=%u bytes.\n",
+                 camera.send_timezone_dst ? 1 : 0,
+                 camera.send_timezone_dst ? 95u : 91u);
         } else {
-          printf("[GEO] DD21 read failed status=0x%x; retaining 95-byte v6-compatible default.\n",
+          printCameraPrefix(static_cast<size_t>(slot), "GEO");
+          printf("DD21 read failed status=0x%x; keeping 95-byte default.\n",
                  param->read.status);
         }
-        beginSonyFeatureHandshake();
+        beginSonyFeatureHandshake(static_cast<size_t>(slot));
       }
       break;
+    }
 
-    case ESP_GATTC_WRITE_CHAR_EVT:
-      if (param->write.handle == g_dd11) {
-        g_tx_inflight = false;
-        printf("[TX] lat=%.7f lon=%.7f packet=%u bytes status=0x%x -> %s\n",
+    case ESP_GATTC_WRITE_CHAR_EVT: {
+      const int slot = findSessionByConnId(param->write.conn_id);
+      if (slot < 0) break;
+      CameraSession& camera = g_cameras[slot];
+
+      if (param->write.handle == camera.dd11) {
+        camera.tx_inflight = false;
+        if (g_global_tx_slot == slot) {
+          g_global_tx_slot = -1;
+          g_next_tx_allowed_us =
+              esp_timer_get_time() + INTER_CAMERA_TX_GAP_US;
+        }
+
+        printCameraPrefix(static_cast<size_t>(slot), "TX");
+        printf("lat=%.7f lon=%.7f packet=%u bytes status=0x%x -> %s\n",
                static_cast<double>(TEST_LAT_E7) / 1.0E7,
                static_cast<double>(TEST_LON_E7) / 1.0E7,
-               g_send_timezone_dst ? 95u : 91u, param->write.status,
+               camera.send_timezone_dst ? 95u : 91u,
+               param->write.status,
                param->write.status == ESP_GATT_OK ? "OK" : "FAIL");
+
         if (param->write.status == ESP_GATT_INSUF_AUTHENTICATION ||
             param->write.status == ESP_GATT_INSUF_ENCRYPTION) {
-          closeAndRescan("[TX] Sony says DD11 link security is insufficient", 3000);
+          closeAndRetry(static_cast<size_t>(slot),
+                        "[TX] Sony reports insufficient link security", 3000);
         }
-      } else if (param->write.handle == g_dd30 && g_stage == Stage::EnableUnlock) {
-        g_gatt_op_inflight = false;
-        if (param->write.status == ESP_GATT_OK && g_dd31 != 0) {
+      } else if (param->write.handle == camera.dd30 &&
+                 camera.stage == Stage::EnableUnlock) {
+        camera.gatt_op_inflight = false;
+        if (param->write.status == ESP_GATT_OK && camera.dd31 != 0) {
           static const uint8_t enable = 0x01;
-          if (submitHandshakeWrite(g_dd31, &enable, 1, Stage::EnableLock,
-                                   "DD31 GPS enable/lock")) break;
+          if (submitHandshakeWrite(static_cast<size_t>(slot),
+                                   camera.dd31, &enable, 1,
+                                   Stage::EnableLock,
+                                   "DD31 GPS enable/lock")) {
+            break;
+          }
         }
-        sendTimeSyncOrReady();
-      } else if (param->write.handle == g_dd31 && g_stage == Stage::EnableLock) {
-        g_gatt_op_inflight = false;
-        sendTimeSyncOrReady();
-      } else if (param->write.handle == g_cc13 && g_stage == Stage::SyncTime) {
-        g_gatt_op_inflight = false;
-        printf("[TIME] CC13 write status=0x%x -> %s\n", param->write.status,
+        sendTimeSyncOrReady(static_cast<size_t>(slot));
+      } else if (param->write.handle == camera.dd31 &&
+                 camera.stage == Stage::EnableLock) {
+        camera.gatt_op_inflight = false;
+        sendTimeSyncOrReady(static_cast<size_t>(slot));
+      } else if (param->write.handle == camera.cc13 &&
+                 camera.stage == Stage::SyncTime) {
+        camera.gatt_op_inflight = false;
+        printCameraPrefix(static_cast<size_t>(slot), "TIME");
+        printf("CC13 write status=0x%x -> %s\n",
+               param->write.status,
                param->write.status == ESP_GATT_OK ? "OK" : "FAIL (continuing)");
-        markLocationReady();
+        markLocationReady(static_cast<size_t>(slot));
       }
       break;
+    }
 
-    case ESP_GATTC_ENC_CMPL_CB_EVT:
-      printf("[PAIR] GATT encryption complete callback. local bond=%d\n",
-             isCameraBonded() ? 1 : 0);
-      // On reconnect with an existing key, Bluedroid may report encryption
-      // without producing a fresh AUTH_CMPL event. Continue only when the
-      // local bond database confirms the peer.
-      if (isCameraBonded()) beginPostBond();
+    case ESP_GATTC_ENC_CMPL_CB_EVT: {
+      // This event does not provide a useful per-link payload in the API used
+      // by the v7 code. Connection setup is intentionally serialized, so at
+      // most one camera should be waiting in Bonding at this moment.
+      for (size_t i = 0; i < MAX_CAMERAS; ++i) {
+        CameraSession& camera = g_cameras[i];
+        if (camera.allocated && camera.connected &&
+            camera.stage == Stage::Bonding &&
+            isCameraBonded(camera)) {
+          printCameraPrefix(i, "PAIR");
+          printf("GATT encryption complete callback; local bond=1\n");
+          beginPostBond(i);
+          break;
+        }
+      }
       break;
+    }
 
-    case ESP_GATTC_DISCONNECT_EVT:
-      printf("[BLE] Disconnected from ");
-      printAddr(param->disconnect.remote_bda);
-      printf(" reason=0x%02x\n", param->disconnect.reason);
-      resetConnectionState();
-      g_stage = Stage::Boot;
-      scheduleRescan(2200);
+    case ESP_GATTC_DISCONNECT_EVT: {
+      int slot = findSessionByConnId(param->disconnect.conn_id);
+      if (slot < 0) slot = findSessionByBda(param->disconnect.remote_bda);
+
+      if (slot >= 0) {
+        printCameraPrefix(static_cast<size_t>(slot), "BLE");
+        printf("Disconnected from ");
+        printAddr(param->disconnect.remote_bda);
+        printf(" reason=0x%02x\n", param->disconnect.reason);
+
+        CameraSession& camera = g_cameras[slot];
+        const uint64_t retry_due = camera.retry_due_us;
+        resetConnectionRuntime(static_cast<size_t>(slot));
+        camera.retry_due_us =
+            retry_due != 0 ? retry_due : esp_timer_get_time() + 2200000ULL;
+        scheduleScan(2200);
+      } else {
+        printf("[BLE] Disconnected unknown peer reason=0x%02x\n",
+               param->disconnect.reason);
+      }
       break;
+    }
 
     default:
       break;
@@ -1065,9 +1398,6 @@ void printBondedDevices() {
 }
 
 void applySecurityProfile() {
-  // v6 profile B is the configuration that paired successfully on the real
-  // A7R III. SC capability is advertised, but SC-only enforcement stays off
-  // so the peer may still negotiate a compatible legacy path if needed.
   esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
   esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
   uint8_t key_size = 16;
@@ -1089,15 +1419,18 @@ void applySecurityProfile() {
   ESP_ERROR_CHECK(esp_ble_gap_set_security_param(
       ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key)));
   ESP_ERROR_CHECK(esp_ble_gap_set_security_param(
-      ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH, &only_accept, sizeof(only_accept)));
+      ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH,
+      &only_accept, sizeof(only_accept)));
 
-  printf("[PAIR] v7 security: GATTS+SC_CAPABLE_BOND auth_req=0x%02x IO=NONE key=16 ENC+ID; SC-only disabled.\n",
+  printf("[PAIR] Security: GATTS+SC_CAPABLE_BOND auth_req=0x%02x "
+         "IO=NONE key=16 ENC+ID; SC-only disabled.\n",
          static_cast<unsigned>(auth_req));
 }
 
 bool initBluetooth() {
   esp_err_t ret = nvs_flash_init();
-  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ret = nvs_flash_init();
   }
@@ -1130,57 +1463,81 @@ bool initBluetooth() {
 
   ESP_ERROR_CHECK(esp_ble_gap_register_callback(gapCallback));
   ESP_ERROR_CHECK(esp_ble_gattc_register_callback(gattcCallback));
-  ESP_ERROR_CHECK(esp_ble_gap_set_device_name("SonyGPS-C6-v7"));
+  ESP_ERROR_CHECK(esp_ble_gap_set_device_name("SonyGPS-C6-multi-dev"));
 
-  // v7 uses the profile that succeeded in the v6 A/B experiment.
   applySecurityProfile();
 
-  // Python reference exchanges MTU 158. The A7R III previously negotiated 128
-  // successfully, so request 158 locally and accept whatever the camera returns.
   ret = esp_ble_gatt_set_local_mtu(158);
   if (ret != ESP_OK) {
-    printf("[BLE] Warning: set local MTU 158 failed: %s\n", esp_err_to_name(ret));
+    printf("[BLE] Warning: set local MTU 158 failed: %s\n",
+           esp_err_to_name(ret));
   }
 
   printBondedDevices();
-  printf("[PAIR] v7 fixed SC-capable bond profile ready; GATTS enabled.\n");
+  printf("[BLE] Multi-camera session manager enabled: max=%u.\n",
+         static_cast<unsigned>(MAX_CAMERAS));
 
   ret = esp_ble_gattc_app_register(APP_ID);
   if (ret != ESP_OK) {
-    printf("[FATAL] GATTC app register failed: %s\n", esp_err_to_name(ret));
+    printf("[FATAL] GATTC app register failed: %s\n",
+           esp_err_to_name(ret));
     return false;
   }
   return true;
 }
 
+void serviceLocationTransmit(uint64_t now) {
+  if (g_global_tx_slot >= 0 || now < g_next_tx_allowed_us) return;
+
+  for (size_t offset = 0; offset < MAX_CAMERAS; ++offset) {
+    const size_t slot = (g_tx_round_robin + offset) % MAX_CAMERAS;
+    CameraSession& camera = g_cameras[slot];
+
+    if (!camera.allocated || !camera.connected || !camera.ready ||
+        camera.tx_inflight || camera.gatt_op_inflight) {
+      continue;
+    }
+
+    if (camera.last_tx_us != 0 &&
+        now - camera.last_tx_us < LOCATION_UPDATE_INTERVAL_US) {
+      continue;
+    }
+
+    camera.last_tx_us = now;
+    g_tx_round_robin = (slot + 1) % MAX_CAMERAS;
+    sendStaticLocation(slot);
+    break;
+  }
+}
+
 } // namespace
 
 extern "C" void app_main(void) {
-  printf("\n=== Sony Alpha ESP32 GPS v7 / timezone + CC13 / XIAO ESP32-C6 / BLUEDROID ===\n");
-  printf("Flow: connect -> SC-capable bond -> MTU -> discover DD00/CC00 -> DD21 -> optional DD30/DD31 -> CC13 -> DD11\n");
-  printf("Static test fix: %.7f, %.7f (E7 integers; public test point near Taipei 101)\n",
+  printf("\n=== Sony Alpha ESP32 GPS multi-camera development / XIAO ESP32-C6 ===\n");
+  printf("Max simultaneous Sony sessions: %u\n",
+         static_cast<unsigned>(MAX_CAMERAS));
+  printf("Flow per camera: connect -> bond -> MTU -> DD00/CC00 -> DD21 -> "
+         "optional DD30/DD31/CC13 -> DD11\n");
+  printf("Static shared fix: %.7f, %.7f\n",
          static_cast<double>(TEST_LAT_E7) / 1.0E7,
          static_cast<double>(TEST_LON_E7) / 1.0E7);
+
   const TimeZoneInfo boot_tz = currentTimeZone(BASE_UTC_EPOCH);
   printf("Timezone resolver: %s standard=%dmin dst=%dmin%s\n",
-         boot_tz.name, boot_tz.standard_offset_minutes, boot_tz.dst_offset_minutes,
+         boot_tz.name, boot_tz.standard_offset_minutes,
+         boot_tz.dst_offset_minutes,
          boot_tz.approximate ? " (approx boundary resolver)" : "");
-  printf("Device name: SonyGPS-C6-v7\n");
+  printf("Device name: SonyGPS-C6-multi-dev\n");
 
   if (!initBluetooth()) return;
 
   for (;;) {
     const uint64_t now = esp_timer_get_time();
 
-    if (g_ready && g_connected && now - g_last_tx_us >= LOCATION_UPDATE_INTERVAL_US) {
-      if (!g_tx_inflight && !g_gatt_op_inflight) {
-        g_last_tx_us = now;
-        sendStaticLocation();
-      }
-    }
+    serviceLocationTransmit(now);
 
-    if (!g_connected && g_rescan_due_us != 0 && now >= g_rescan_due_us &&
-        g_stage != Stage::Scanning && g_stage != Stage::Connecting) {
+    if (g_scan_due_us != 0 && now >= g_scan_due_us &&
+        !g_scan_active && g_opening_slot < 0) {
       startScan();
     }
 
