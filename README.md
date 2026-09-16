@@ -100,7 +100,7 @@ framework = espidf
 
 Open in VS Code/PlatformIO, then **Build**, **Upload**, and **Monitor** at `115200` baud. After changing Bluetooth Kconfig options, perform a clean rebuild; on Windows use `CLEAN_REBUILD_WINDOWS.bat`.
 
-> The v7 source was host-reviewed and the standalone timezone/DST math was host-tested, but this environment did not have the ESP-IDF/PlatformIO toolchain available for a full firmware build. A normal PlatformIO build and A7R III re-test are therefore part of v7 validation.
+> **Build validation:** GitHub Actions now performs a clean PlatformIO/ESP-IDF build for `seeed_xiao_esp32c6`, and the first v7 CI build completed successfully. Real-hardware upload, fresh-pair/reconnect, DD21 91/95-byte behavior, E7 ARW verification, and CC13 camera-time behavior still require A7R III testing.
 
 ## Planned portable hardware
 
