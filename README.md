@@ -6,7 +6,7 @@ Open-source, reverse-engineered **BLE GPS / geotagging adapter for Sony Alpha ca
 
 > **AI-assisted development:** this project was developed with substantial technical and documentation assistance from **OpenAI ChatGPT (GPT-5.6 Sol)**. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
 
-> **Current release: v7 (experimental).** The v6 Sony BLE path was verified end-to-end on a **Sony A7R III (ILCE-7RM3, firmware 3.01)**, including persistent bonding and GPS data written into ARW EXIF. v7 keeps that known-good BLE foundation, removes the A/B pairing experiment, adds DD21-aware 91/95-byte packet generation, optional DD30/DD31 support, a compact offline timezone/DST resolver, E7 coordinate preservation, and optional CC13 camera-clock synchronization. The new v7 additions still require real-camera re-validation.
+> **Current release: v7.** The core v7 path has now been re-validated on a **Sony A7R III (ILCE-7RM3, firmware 3.01)**: existing-bond reconnect, MTU 158, DD21-driven 95-byte packet selection, repeated DD11 writes, E7 coordinate preservation into ARW EXIF, and timezone metadata written as `+08:00` for the Taiwan test coordinate. Fresh pairing after deleting bond state on both sides still remains to be repeated with v7.
 
 This is a community interoperability project and is **not affiliated with, sponsored by, or endorsed by Sony or u-blox**.
 
@@ -27,23 +27,24 @@ This is a community interoperability project and is **not affiliated with, spons
 - Adds a **compact no-external-flash timezone/DST resolver** for common travel regions, with an approximate longitude fallback.
 - Uses a public 7-decimal test point near Taipei 101 and a 5-second update interval for v7 testing.
 
-## Verified baseline vs v7 additions
+## Verified baseline and v7 status
 
 | Feature | Status |
 |---|---|
-| ESP32-C6 scan/connect to A7R III | ✅ Verified in v6 |
-| SMP bond/encryption | ✅ Verified in v6 |
-| Bond persistence after full power removal | ✅ Verified in v6 |
-| MTU request 158 | ✅ Verified in v6 |
-| DD00 / DD11 / DD21 path | ✅ Verified in v6 |
-| 95-byte location write | ✅ Verified in v6 |
-| ARW GPS EXIF validation | ✅ Verified in v6 |
-| Fixed SC-capable security profile | 🧪 v7, derived from v6 successful profile |
-| DD21-driven 91/95-byte selection | 🧪 v7, needs camera re-test |
-| E7 7-decimal preservation test | 🧪 v7, needs new ARW capture |
-| Optional DD30/DD31 sequence | 🧪 v7, not exposed on tested A7R III |
-| Offline timezone/DST resolver | 🧪 v7 software-tested; boundary resolver is intentionally compact |
-| CC13 camera local-time sync | 🧪 v7 implemented, **disabled by default** until real GNSS drives timezone |
+| ESP32-C6 scan/connect to A7R III | ✅ Verified |
+| SMP bond/encryption | ✅ Verified |
+| Bond persistence after full power removal | ✅ Verified |
+| MTU request 158 | ✅ Verified |
+| DD00 / DD11 / DD21 path | ✅ Verified |
+| Fixed single SC-capable security profile on reconnect | ✅ v7 verified |
+| DD21-driven 95-byte selection on tested A7R III | ✅ v7 verified |
+| Repeated 95-byte DD11 writes | ✅ v7 verified |
+| E7 7-decimal coordinate preservation to ARW | ✅ v7 verified |
+| Taiwan timezone metadata (`+08:00`) | ✅ v7 verified |
+| Fresh pairing after clearing bond state | ⏳ v7 re-test pending |
+| Optional DD30/DD31 sequence | 🧪 not exposed on tested A7R III |
+| Offline timezone/DST resolver | ✅ Taiwan path verified; global boundaries remain compact/approximate |
+| CC13 camera local-time sync | 🧪 implemented, **disabled by default**; CC13 not exposed on tested A7R III |
 | Real MAX-M10S GNSS input | 🚧 Next |
 
 ## Sony BLE flow
@@ -62,11 +63,38 @@ scan
   -> DD11 location writes
 ```
 
-The tested A7R III did **not** expose `DD30` or `DD31`, so they remain optional.
+The tested A7R III did **not** expose `DD30`, `DD31`, or `CC13`, so those paths remain optional.
+
+## v7 ARW result
+
+The static test coordinate was:
+
+```text
+25.0339687, 121.5644687
+```
+
+The A7R III stored:
+
+```text
+25° 2' 2.287" N
+121° 33' 52.087" E
+= 25.0339686111, 121.5644686111
+```
+
+The small difference is the camera's final EXIF rational quantization to 0.001 arc-second; in this test it corresponds to about one centimeter. The ARW also contained:
+
+```text
+GPSDateStamp:          2026:09:16
+GPSTimeStamp:          00:01:44 UTC
+DateTimeOriginal:      2026:09:16 08:01:45
+OffsetTimeOriginal:    +08:00
+```
+
+This confirms the v7 DD21 -> timezone/DST -> DD11 -> ARW path on the tested camera.
 
 ## Timezone behavior in v7
 
-The standalone ESP32 cannot simply ask a phone for its system timezone like Alpha-GPS does. v7 therefore includes a compact coordinate-to-timezone resolver in firmware. It explicitly covers several common travel regions (including Taiwan, Hong Kong, Japan/Korea, China, Southeast Asia, India/Nepal, Australia, New Zealand/McMurdo, much of Europe, and the United States) and implements common DST rules. Other locations fall back to a longitude-derived standard UTC offset with no DST.
+The standalone ESP32 cannot ask a phone for its system timezone like Alpha-GPS does. v7 therefore includes a compact coordinate-to-timezone resolver in firmware. It explicitly covers several common travel regions and implements common DST rules. Other locations fall back to a longitude-derived standard UTC offset with no DST.
 
 This is deliberately **not a full IANA timezone-boundary database**. Border areas and unusual regional rules can be approximate. A future compact polygon/grid database can improve global precision without requiring external SPI flash.
 
@@ -76,17 +104,7 @@ This is deliberately **not a full IANA timezone-boundary database**. Border area
 constexpr bool ENABLE_CAMERA_TIME_SYNC = false;
 ```
 
-This prevents a static test coordinate from unexpectedly changing a user's camera clock. It can be enabled after live GNSS/timezone input is integrated and re-tested.
-
-## Current static v7 test
-
-The firmware currently uses a public synthetic test fix near Taipei 101 with non-zero seventh decimal digits:
-
-```text
-25.0339687, 121.5644687
-```
-
-This is intentional: a new ARW capture can verify whether the complete path preserves E7 resolution.
+The tested A7R III 3.01 does not expose `CC13`, so camera-clock synchronization cannot be validated on this body through that characteristic.
 
 ## Build
 
@@ -100,7 +118,7 @@ framework = espidf
 
 Open in VS Code/PlatformIO, then **Build**, **Upload**, and **Monitor** at `115200` baud. After changing Bluetooth Kconfig options, perform a clean rebuild; on Windows use `CLEAN_REBUILD_WINDOWS.bat`.
 
-> **Build validation:** GitHub Actions now performs a clean PlatformIO/ESP-IDF build for `seeed_xiao_esp32c6`, and the first v7 CI build completed successfully. Real-hardware upload, fresh-pair/reconnect, DD21 91/95-byte behavior, E7 ARW verification, and CC13 camera-time behavior still require A7R III testing.
+> **Build validation:** GitHub Actions performs a clean PlatformIO/ESP-IDF build for `seeed_xiao_esp32c6`. Real-hardware v7 reconnect, DD21 95-byte selection, DD11 transmission, E7 ARW preservation and Taiwan timezone metadata have also now been validated on the A7R III.
 
 ## Planned portable hardware
 
