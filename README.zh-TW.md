@@ -118,7 +118,7 @@ framework = espidf
 
 VS Code / PlatformIO 執行 **Build → Upload → Monitor**，序列埠 `115200`。變更 Bluetooth Kconfig 後請 clean rebuild；Windows 可直接執行 `CLEAN_REBUILD_WINDOWS.bat`。
 
-> 本次 v7 已做 source review，且 timezone/DST 純 C++ 演算法已在 host 端編譯測試；但目前這個執行環境沒有 ESP-IDF / PlatformIO toolchain，因此尚未在此環境完成完整 firmware build。實際 PlatformIO build 與 A7R III 重測列為 v7 validation。
+> **Build 驗證：** GitHub Actions 現在會對 `seeed_xiao_esp32c6` 執行乾淨的 PlatformIO / ESP-IDF build，第一輪 v7 CI 已成功通過。接下來仍需 A7R III 實機燒錄、fresh pair／reconnect、DD21 91/95-byte、E7 ARW 與 CC13 相機時間同步驗證。
 
 ## 預計硬體
 
