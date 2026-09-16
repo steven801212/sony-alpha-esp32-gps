@@ -6,7 +6,7 @@
 
 > **AI 協作開發：** 本專案在 Sony BLE protocol 分析、ESP-IDF / Bluedroid 除錯、韌體迭代、RAW/EXIF 驗證規劃、文件與硬體架構規劃上，大量使用 **OpenAI ChatGPT（GPT-5.6 Sol）** 協作。完整說明見 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。
 
-> **目前版本：v7。** v7 核心路徑已在 **Sony A7R III（ILCE-7RM3，韌體 3.01）** 重新完成實機驗證：既有 Bond 重連、MTU 158、DD21 自動選擇 95-byte 封包、連續 DD11 寫入、E7 七位小數座標寫入 ARW，以及台灣測試座標對應的 `+08:00` timezone metadata。v7 尚未完成「雙方清除 Bond 後重新 fresh pair」這一項重測。
+> **目前版本：v7。** v7 核心路徑已在 **Sony A7R III（ILCE-7RM3，韌體 3.01）** 完成實機驗證：空白本機 Bond DB 的 fresh pairing、SMP `REPEATED_ATTEMPT` 後自動用相同 profile 重試、Bond 持久化、冷啟動自動重連、MTU 158、DD21 自動選擇 95-byte 封包、連續 DD11 寫入、E7 七位小數座標寫入 ARW，以及台灣測試座標對應的 `+08:00` timezone metadata。
 
 本專案是社群 reverse-engineering / interoperability 專案，**與 Sony、u-blox 無官方關係，也未獲其贊助或背書**。
 
@@ -32,16 +32,18 @@
 | 項目 | 狀態 |
 |---|---|
 | ESP32-C6 掃描／連線 A7R III | ✅ 已驗證 |
+| 空白本機 Bond DB 的 fresh pair | ✅ v7 已驗證 |
+| SMP `REPEATED_ATTEMPT` 後自動重試 | ✅ v7 已驗證 |
 | SMP bond/encryption | ✅ 已驗證 |
-| 完全斷電後 Bond persistence | ✅ 已驗證 |
+| 完全斷電後 Bond persistence | ✅ v7 已驗證 |
+| 不重新配對的 cold reconnect | ✅ v7 已驗證 |
 | MTU request 158 | ✅ 已驗證 |
 | DD00 / DD11 / DD21 | ✅ 已驗證 |
-| v7 固定單一 SC-capable security profile 重連 | ✅ 已驗證 |
-| DD21 自動選擇 95-byte | ✅ 已驗證 |
-| 連續 95-byte DD11 write | ✅ 已驗證 |
-| E7 七位小數寫入 ARW | ✅ 已驗證 |
-| 台灣 timezone metadata `+08:00` | ✅ 已驗證 |
-| 清除 Bond 後 fresh pair | ⏳ v7 尚待重測 |
+| v7 固定單一 SC-capable security profile | ✅ v7 已驗證 |
+| DD21 自動選擇 95-byte | ✅ v7 已驗證 |
+| 連續 95-byte DD11 write | ✅ v7 已驗證 |
+| E7 七位小數寫入 ARW | ✅ v7 已驗證 |
+| 台灣 timezone metadata `+08:00` | ✅ v7 已驗證 |
 | DD30/DD31 optional flow | 🧪 本機 A7R III 未提供 |
 | 內建 timezone / DST | ✅ 台灣路徑已驗證；全球邊界仍是簡化版 |
 | CC13 相機時間同步 | 🧪 已實作、預設關閉；本機 A7R III 未提供 CC13 |
@@ -62,6 +64,34 @@ scan
 ```
 
 這台 A7R III 3.01 實測沒有 `DD30`、`DD31`、`CC13`，因此 v7 會正確略過這些 optional path。
+
+### Fresh pair 與冷啟動重連
+
+ESP32 本機 Bond DB 為空時，v7 顯示：
+
+```text
+local bond before request=0
+```
+
+第一次 SMP 嘗試回報 `REPEATED_ATTEMPT`；v7 斷線後使用**同一套固定 security profile** 自動重試。第二次成功交換 key 並建立 Bond：
+
+```text
+Key exchanged: 1 / 2 / 16 / 32
+Authentication complete: success=1
+local bond now=1
+```
+
+之後完成斷電／重新連線，且沒有再次進入相機配對流程時，v7 顯示：
+
+```text
+local bond before request=1
+Authentication complete: success=1
+MTU=158
+DD21 -> 95 bytes
+DD11 TX -> OK
+```
+
+因此已證明 Bond 可持久化保存，並在重新連線後自動恢復 Sony GPS 傳輸路徑。
 
 ## v7 ARW 實測結果
 
@@ -134,7 +164,7 @@ framework = espidf
 
 VS Code / PlatformIO 執行 **Build → Upload → Monitor**，序列埠 `115200`。變更 Bluetooth Kconfig 後請 clean rebuild；Windows 可直接執行 `CLEAN_REBUILD_WINDOWS.bat`。
 
-> **Build / 實機驗證：** GitHub Actions 已完成 XIAO ESP32-C6 的乾淨 PlatformIO / ESP-IDF build；v7 的 A7R III 重連、DD21 95-byte、自動 timezone、DD11 傳送與 ARW E7 寫入也已實機驗證。
+> **Build / 實機驗證：** GitHub Actions 已完成 XIAO ESP32-C6 的乾淨 PlatformIO / ESP-IDF build；v7 的 fresh pair、Bond 持久化、cold reconnect、DD21 95-byte、自動 timezone、DD11 傳送與 ARW E7 寫入也已在 A7R III 實機驗證。
 
 ## 預計硬體
 
